@@ -1,32 +1,29 @@
 import os
-import time
 import logging
 from datetime import datetime, timedelta, timezone
+import asyncio
 
 import requests
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 # --- Config via environment variables ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 APISPORTS_KEY = os.getenv("APISPORTS_KEY")  # API-Sports direct key
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
-LEAGUE_FILTER = os.getenv("LEAGUE_FILTER", "")  # e.g. "England:Premier League,Italy:Serie A"
+LEAGUE_FILTER = os.getenv("LEAGUE_FILTER", "")  # "England:Premier League,Italy:Serie A"
 MINUTE_WINDOW_START = int(os.getenv("MINUTE_WINDOW_START", "30"))
 MINUTE_WINDOW_END = int(os.getenv("MINUTE_WINDOW_END", "85"))
 SCORE_THRESHOLD = float(os.getenv("SCORE_THRESHOLD", "3.0"))
 ALERT_COOLDOWN_MIN = int(os.getenv("ALERT_COOLDOWN_MIN", "20"))
 
 # --- Logger ---
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 log = logging.getLogger("goal-alert-bot")
 
 # --- Memory storage ---
 SUBSCRIBERS = set()
-LAST_ALERT = {}
+LAST_ALERT = {}  # fixture_id -> datetime
 
 # --- Helpers ---
 def parse_league_filter(filter_str: str):
@@ -53,6 +50,7 @@ def league_allowed(country: str, league: str) -> bool:
     l = (league or "").lower()
     return (c, l) in LEAGUE_FILTER_PARSED or ("", l) in LEAGUE_FILTER_PARSED
 
+# --- API-Sports calls (sync) ---
 def api_get_live_fixtures():
     url = "https://v3.football.api-sports.io/fixtures"
     headers = {"x-apisports-key": APISPORTS_KEY}
@@ -91,16 +89,16 @@ def safe_stat(stats_list, key):
 
 def score_fixture_for_goal(stats_list, minute: int) -> float:
     shots_on_goal = safe_stat(stats_list, "Shots on Goal")
-    total_shots = safe_stat(stats_list, "Total Shots")
+    total_shots   = safe_stat(stats_list, "Total Shots")
     dangerous_att = safe_stat(stats_list, "Dangerous Attacks")
-    attacks = safe_stat(stats_list, "Attacks")
-    possession = safe_stat(stats_list, "Ball Possession")
+    attacks       = safe_stat(stats_list, "Attacks")
+    possession    = safe_stat(stats_list, "Ball Possession")
 
-    sog_norm = shots_on_goal / 6.0
+    sog_norm   = shots_on_goal / 6.0
     shots_norm = total_shots / 20.0
-    dang_norm = dangerous_att / 100.0
-    atk_norm = attacks / 200.0
-    poss_norm = (abs(possession - 100) / 100.0) if possession else 0.0
+    dang_norm  = dangerous_att / 100.0
+    atk_norm   = attacks / 200.0
+    poss_norm  = (abs(possession - 100) / 100.0) if possession else 0.0
 
     minute_boost = 0.0
     if 30 <= minute <= 44 or 60 <= minute <= 85:
@@ -108,14 +106,7 @@ def score_fixture_for_goal(stats_list, minute: int) -> float:
     elif 45 < minute < 60:
         minute_boost = 0.2
 
-    score = (
-        0.45 * sog_norm
-        + 0.25 * shots_norm
-        + 0.15 * dang_norm
-        + 0.10 * atk_norm
-        + 0.05 * poss_norm
-        + minute_boost
-    )
+    score = 0.45*sog_norm + 0.25*shots_norm + 0.15*dang_norm + 0.10*atk_norm + 0.05*poss_norm + minute_boost
     return round(score, 3)
 
 def should_alert(fixture_id: int) -> bool:
@@ -165,7 +156,7 @@ async def tune(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         await update.message.reply_text("Kullanım: /tune 2.8")
 
-# --- Main polling loop ---
+# --- Background polling task (non-blocking) ---
 async def poll_loop(app):
     if not TELEGRAM_BOT_TOKEN or not APISPORTS_KEY:
         log.error("Missing TELEGRAM_BOT_TOKEN or APISPORTS_KEY in environment.")
@@ -173,14 +164,15 @@ async def poll_loop(app):
 
     while True:
         try:
-            fixtures = api_get_live_fixtures()
+            # run the blocking HTTP calls in a thread to avoid blocking event loop
+            fixtures = await asyncio.to_thread(api_get_live_fixtures)
             for f in fixtures:
                 fixture = f.get("fixture", {})
-                league = f.get("league", {})
-                teams = f.get("teams", {})
-                goals = f.get("goals", {})
-                status = fixture.get("status", {})
-                minute = status.get("elapsed") or 0
+                league  = f.get("league", {})
+                teams   = f.get("teams", {})
+                goals   = f.get("goals", {})
+                status  = fixture.get("status", {})
+                minute  = status.get("elapsed") or 0
 
                 if not (MINUTE_WINDOW_START <= minute <= MINUTE_WINDOW_END):
                     continue
@@ -191,7 +183,7 @@ async def poll_loop(app):
                     continue
 
                 fixture_id = fixture.get("id")
-                stats = api_get_stats(fixture_id)
+                stats = await asyncio.to_thread(api_get_stats, fixture_id)
                 if not stats:
                     continue
 
@@ -212,34 +204,26 @@ async def poll_loop(app):
         except Exception as e:
             log.error("Poll error: %s", e)
 
-        time.sleep(POLL_INTERVAL_SECONDS)
+        await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
-def main():
+# --- Entry point ---
+async def main():
     if not TELEGRAM_BOT_TOKEN:
         raise SystemExit("Set TELEGRAM_BOT_TOKEN in environment.")
     if not APISPORTS_KEY:
         raise SystemExit("Set APISPORTS_KEY (API-Sports key) in environment.")
 
-    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("stop", stop))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("tune", tune))
 
-    async def runner():
-        import asyncio
-        await application.initialize()
-        await application.start()
-        await application.updater.start_polling()  # 🔹 Telegram komutlarını dinle
-        try:
-            await poll_loop(application)  # 🔹 Canlı maç tarama döngüsü
-        finally:
-            await application.updater.stop()
-            await application.stop()
-            await application.shutdown()
+    # Start background polling task
+    application.create_task(poll_loop(application))
 
-    import asyncio
-    asyncio.run(runner())
+    # Start receiving Telegram updates (blocks until stopped)
+    await application.run_polling()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
