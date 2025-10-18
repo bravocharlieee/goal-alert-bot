@@ -9,7 +9,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # --- Config via environment variables ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY")  # API-Football on RapidAPI
+APISPORTS_KEY = os.getenv("APISPORTS_KEY")  # API-Sports direct key
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
 LEAGUE_FILTER = os.getenv("LEAGUE_FILTER", "")  # e.g. "England:Premier League,Italy:Serie A"
 MINUTE_WINDOW_START = int(os.getenv("MINUTE_WINDOW_START", "30"))
@@ -30,10 +30,6 @@ ALERT_COOLDOWN_MIN = int(os.getenv("ALERT_COOLDOWN_MIN", "20"))
 
 # --- Helpers ---
 def parse_league_filter(filter_str: str):
-    """
-    Convert "Country:League,Country2:League2" to set of tuples {(country, league), ...}
-    If empty -> no filter.
-    """
     if not filter_str.strip():
         return None
     items = set()
@@ -58,44 +54,28 @@ def league_allowed(country: str, league: str) -> bool:
     return (c, l) in LEAGUE_FILTER_PARSED or ("", l) in LEAGUE_FILTER_PARSED
 
 def api_get_live_fixtures():
-    """
-    Fetch live fixtures from API-Football (RapidAPI).
-    Docs: https://rapidapi.com/api-sports/api/api-football/
-    Endpoint: /v3/fixtures?live=all
-    """
-    url = "https://api-football-v1.p.rapidapi.com/v3/fixtures"
-    headers = {
-        "x-rapidapi-key": RAPIDAPI_KEY,
-        "x-rapidapi-host": "api-football-v1.p.rapidapi.com"
-    }
+    url = "https://v3.football.api-sports.io/fixtures"
+    headers = {"x-apisports-key": APISPORTS_KEY}
     params = {"live": "all"}
     r = requests.get(url, headers=headers, params=params, timeout=20)
+    if not r.ok:
+        log.error("API error %s: %s", r.status_code, r.text)
     r.raise_for_status()
     data = r.json()
     return data.get("response", [])
 
 def api_get_stats(fixture_id: int):
-    """
-    Fetch statistics for a fixture.
-    Endpoint: /v3/fixtures/statistics?fixture={id}
-    """
-    url = "https://api-football-v1.p.rapidapi.com/v3/fixtures/statistics"
-    headers = {
-        "x-rapidapi-key": RAPIDAPI_KEY,
-        "x-rapidapi-host": "api-football-v1.p.rapidapi.com"
-    }
+    url = "https://v3.football.api-sports.io/fixtures/statistics"
+    headers = {"x-apisports-key": APISPORTS_KEY}
     params = {"fixture": fixture_id}
     r = requests.get(url, headers=headers, params=params, timeout=20)
+    if not r.ok:
+        log.error("API stats error %s: %s", r.status_code, r.text)
     r.raise_for_status()
     data = r.json()
     return data.get("response", [])
 
-def safe_stat(stats_list, team_type, key):
-    """
-    stats_list: API response for statistics (list of two entries: home & away dicts)
-    team_type: "home" or "away" -> index 0/home or 1/away is not guaranteed; we search by team id/name if necessary
-    For simplicity, we sum both teams' stat values where applicable.
-    """
+def safe_stat(stats_list, key):
     total = 0
     for t in stats_list:
         for s in t.get("statistics", []):
@@ -103,7 +83,7 @@ def safe_stat(stats_list, team_type, key):
                 val = s.get("value")
                 if isinstance(val, str):
                     try:
-                        val = int(val.replace("%", "").strip())
+                        val = int(val.replace("%","").strip())
                     except:
                         val = 0
                 if val is None:
@@ -113,37 +93,24 @@ def safe_stat(stats_list, team_type, key):
     return total
 
 def score_fixture_for_goal(stats_list, minute: int) -> float:
-    """
-    Heuristic scoring for "goal likely soon". You can tweak coefficients via env if needed.
-    Core components we try to use if present:
-    - Shots on goal (a.k.a. shots on target)
-    - Total shots
-    - Dangerous attacks
-    - Attacks
-    - Possession (high & imbalanced can help)
-    """
-    # Extract stats (sum home+away where it makes sense)
-    shots_on_goal = safe_stat(stats_list, None, "Shots on Goal")
-    total_shots   = safe_stat(stats_list, None, "Total Shots")
-    dangerous_att = safe_stat(stats_list, None, "Dangerous Attacks")
-    attacks       = safe_stat(stats_list, None, "Attacks")
-    possession    = safe_stat(stats_list, None, "Ball Possession")  # as percentage sum (≈ 100)
+    shots_on_goal = safe_stat(stats_list, "Shots on Goal")
+    total_shots   = safe_stat(stats_list, "Total Shots")
+    dangerous_att = safe_stat(stats_list, "Dangerous Attacks")
+    attacks       = safe_stat(stats_list, "Attacks")
+    possession    = safe_stat(stats_list, "Ball Possession")
 
-    # Normalize components roughly
-    sog_norm = shots_on_goal / 6.0         # 6+ on target combined is hot
-    shots_norm = total_shots / 20.0        # 20+ total shots combined is hot
-    dang_norm = dangerous_att / 100.0      # 100+ dangerous attacks combined is hot
-    atk_norm = attacks / 200.0             # 200+ attacks combined is hot
-    poss_norm = (abs(possession - 100) / 100.0) if possession else 0.0  # imbalance
+    sog_norm = shots_on_goal / 6.0
+    shots_norm = total_shots / 20.0
+    dang_norm = dangerous_att / 100.0
+    atk_norm = attacks / 200.0
+    poss_norm = (abs(possession - 100) / 100.0) if possession else 0.0
 
-    # Minute pressure curve: favor 30-44 and 60-85 by pushing score up in those ranges
     minute_boost = 0.0
     if 30 <= minute <= 44 or 60 <= minute <= 85:
         minute_boost = 0.5
     elif 45 < minute < 60:
         minute_boost = 0.2
 
-    # Final weighted score
     score = (
         0.45 * sog_norm +
         0.25 * shots_norm +
@@ -203,8 +170,8 @@ async def tune(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Main polling loop ---
 async def poll_loop(app):
-    if not TELEGRAM_BOT_TOKEN or not RAPIDAPI_KEY:
-        log.error("Missing TELEGRAM_BOT_TOKEN or RAPIDAPI_KEY in environment.")
+    if not TELEGRAM_BOT_TOKEN or not APISPORTS_KEY:
+        log.error("Missing TELEGRAM_BOT_TOKEN or APISPORTS_KEY in environment.")
         return
 
     while True:
@@ -218,7 +185,6 @@ async def poll_loop(app):
                 status  = fixture.get("status", {})
                 minute  = status.get("elapsed") or 0
 
-                # Filter by minute window
                 if not (MINUTE_WINDOW_START <= minute <= MINUTE_WINDOW_END):
                     continue
 
@@ -228,7 +194,6 @@ async def poll_loop(app):
                     continue
 
                 fixture_id = fixture.get("id")
-                # Get stats
                 stats = api_get_stats(fixture_id)
                 if not stats:
                     continue
@@ -253,14 +218,13 @@ async def poll_loop(app):
         except Exception as e:
             log.error("Poll error: %s", e)
 
-        await app.bot._application.post_stop()  # no-op compatibility guard
         time.sleep(POLL_INTERVAL_SECONDS)
 
 def main():
     if not TELEGRAM_BOT_TOKEN:
         raise SystemExit("Set TELEGRAM_BOT_TOKEN in environment.")
-    if not RAPIDAPI_KEY:
-        raise SystemExit("Set RAPIDAPI_KEY (RapidAPI API-Football key) in environment.")
+    if not APISPORTS_KEY:
+        raise SystemExit("Set APISPORTS_KEY (API-Sports key) in environment.")
 
     application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
@@ -269,8 +233,6 @@ def main():
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("tune", tune))
 
-    # Run polling + background task
-    # Using application.run_polling() would block; we manually start and run our loop in a thread-like fashion.
     async def runner():
         await application.initialize()
         await application.start()
