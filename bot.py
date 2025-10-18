@@ -14,7 +14,8 @@ POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
 LEAGUE_FILTER = os.getenv("LEAGUE_FILTER", "")  # e.g. "England:Premier League,Italy:Serie A"
 MINUTE_WINDOW_START = int(os.getenv("MINUTE_WINDOW_START", "30"))
 MINUTE_WINDOW_END = int(os.getenv("MINUTE_WINDOW_END", "85"))
-SCORE_THRESHOLD = float(os.getenv("SCORE_THRESHOLD", "3.0"))  # raise/lower to tune sensitivity
+SCORE_THRESHOLD = float(os.getenv("SCORE_THRESHOLD", "3.0"))
+ALERT_COOLDOWN_MIN = int(os.getenv("ALERT_COOLDOWN_MIN", "20"))
 
 # --- Logger ---
 logging.basicConfig(
@@ -23,10 +24,9 @@ logging.basicConfig(
 )
 log = logging.getLogger("goal-alert-bot")
 
-# --- Simple in-memory storage ---
-SUBSCRIBERS = set()          # chat IDs to notify
-LAST_ALERT = {}              # fixture_id -> timestamp of last alert
-ALERT_COOLDOWN_MIN = int(os.getenv("ALERT_COOLDOWN_MIN", "20"))
+# --- Memory storage ---
+SUBSCRIBERS = set()
+LAST_ALERT = {}
 
 # --- Helpers ---
 def parse_league_filter(filter_str: str):
@@ -61,8 +61,7 @@ def api_get_live_fixtures():
     if not r.ok:
         log.error("API error %s: %s", r.status_code, r.text)
     r.raise_for_status()
-    data = r.json()
-    return data.get("response", [])
+    return r.json().get("response", [])
 
 def api_get_stats(fixture_id: int):
     url = "https://v3.football.api-sports.io/fixtures/statistics"
@@ -72,8 +71,7 @@ def api_get_stats(fixture_id: int):
     if not r.ok:
         log.error("API stats error %s: %s", r.status_code, r.text)
     r.raise_for_status()
-    data = r.json()
-    return data.get("response", [])
+    return r.json().get("response", [])
 
 def safe_stat(stats_list, key):
     total = 0
@@ -83,21 +81,20 @@ def safe_stat(stats_list, key):
                 val = s.get("value")
                 if isinstance(val, str):
                     try:
-                        val = int(val.replace("%","").strip())
+                        val = int(val.replace("%", "").strip())
                     except:
                         val = 0
                 if val is None:
                     val = 0
-                if isinstance(val, (int, float)):
-                    total += val
+                total += int(val)
     return total
 
 def score_fixture_for_goal(stats_list, minute: int) -> float:
     shots_on_goal = safe_stat(stats_list, "Shots on Goal")
-    total_shots   = safe_stat(stats_list, "Total Shots")
+    total_shots = safe_stat(stats_list, "Total Shots")
     dangerous_att = safe_stat(stats_list, "Dangerous Attacks")
-    attacks       = safe_stat(stats_list, "Attacks")
-    possession    = safe_stat(stats_list, "Ball Possession")
+    attacks = safe_stat(stats_list, "Attacks")
+    possession = safe_stat(stats_list, "Ball Possession")
 
     sog_norm = shots_on_goal / 6.0
     shots_norm = total_shots / 20.0
@@ -112,12 +109,12 @@ def score_fixture_for_goal(stats_list, minute: int) -> float:
         minute_boost = 0.2
 
     score = (
-        0.45 * sog_norm +
-        0.25 * shots_norm +
-        0.15 * dang_norm +
-        0.10 * atk_norm +
-        0.05 * poss_norm +
-        minute_boost
+        0.45 * sog_norm
+        + 0.25 * shots_norm
+        + 0.15 * dang_norm
+        + 0.10 * atk_norm
+        + 0.05 * poss_norm
+        + minute_boost
     )
     return round(score, 3)
 
@@ -179,11 +176,11 @@ async def poll_loop(app):
             fixtures = api_get_live_fixtures()
             for f in fixtures:
                 fixture = f.get("fixture", {})
-                league  = f.get("league", {})
-                teams   = f.get("teams", {})
-                goals   = f.get("goals", {})
-                status  = fixture.get("status", {})
-                minute  = status.get("elapsed") or 0
+                league = f.get("league", {})
+                teams = f.get("teams", {})
+                goals = f.get("goals", {})
+                status = fixture.get("status", {})
+                minute = status.get("elapsed") or 0
 
                 if not (MINUTE_WINDOW_START <= minute <= MINUTE_WINDOW_END):
                     continue
@@ -205,14 +202,11 @@ async def poll_loop(app):
                     away = teams.get("away", {}).get("name", "Away")
                     hg = goals.get("home", 0)
                     ag = goals.get("away", 0)
-
                     text = (
                         f"🔥 Gol İhtimali Yüksek!\n"
-                        f"{home} {hg} - {ag} {away}  |  {minute}'. dk\n"
+                        f"{home} {hg}-{ag} {away} | {minute}'. dk\n"
                         f"Lig: {country} • {league_name}\n"
-                        f"Skor: {hg}-{ag}\n"
-                        f"Model skoru: {score} (eşik: {SCORE_THRESHOLD})\n"
-                        f"İpucu: /tune ile eşiği ayarlayabilirsin."
+                        f"Model skoru: {score} (eşik: {SCORE_THRESHOLD})"
                     )
                     await send_alert(app, text)
         except Exception as e:
@@ -227,18 +221,20 @@ def main():
         raise SystemExit("Set APISPORTS_KEY (API-Sports key) in environment.")
 
     application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("stop", stop))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("tune", tune))
 
     async def runner():
+        import asyncio
         await application.initialize()
         await application.start()
+        await application.updater.start_polling()  # 🔹 Telegram komutlarını dinle
         try:
-            await poll_loop(application)
+            await poll_loop(application)  # 🔹 Canlı maç tarama döngüsü
         finally:
+            await application.updater.stop()
             await application.stop()
             await application.shutdown()
 
